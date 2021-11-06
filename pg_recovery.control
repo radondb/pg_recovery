@@ -1,0 +1,5 @@
+# pg_dirtyread
+default_version = '1.0'
+comment = 'recovery table data of update/delete/rollback rows and drop columns'
+module_pathname = '$libdir/pg_recovery'
+relocatable = true

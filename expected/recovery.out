@@ -1,0 +1,232 @@
+-- create extension
+CREATE EXTENSION pg_recovery;
+-- check version
+SELECT setting::int >= 120000 AS is_pg_12 FROM pg_settings WHERE name = 'server_version_num';
+ is_pg_12 
+----------
+ t
+(1 row)
+
+-- Create table and disable autovacuum
+CREATE TABLE foo (bar bigint, baz text);
+ALTER TABLE foo SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);
+-- single row
+INSERT INTO foo VALUES (1, 'Hello world');
+SELECT * FROM pg_recovery('foo') as t(bar bigint, baz text);
+ bar | baz 
+-----+-----
+(0 rows)
+
+DELETE FROM foo;
+SELECT * FROM pg_recovery('foo') as t(bar bigint, baz text);
+ bar |     baz     
+-----+-------------
+   1 | Hello world
+(1 row)
+
+select * from foo;
+ bar | baz 
+-----+-----
+(0 rows)
+
+VACUUM foo;
+-- multiple rows
+INSERT INTO foo VALUES (1, 'Delete'), (2, 'Insert'), (3, 'Update'), (4, 'Not deleted'), (5, 'Not updated');
+DELETE FROM foo WHERE bar = 1;
+UPDATE foo SET baz = 'Updated' WHERE bar = 3;
+BEGIN;
+	DELETE FROM foo WHERE bar = 4;
+	UPDATE foo SET baz = 'Not quite updated' where bar = 5;
+	INSERT INTO foo VALUES (6, 'Not inserted');
+ROLLBACK;
+SELECT * FROM foo;
+ bar |     baz     
+-----+-------------
+   2 | Insert
+   4 | Not deleted
+   5 | Not updated
+   3 | Updated
+(4 rows)
+
+SELECT * FROM pg_recovery('foo') as t(bar bigint, baz text);
+ bar |        baz        
+-----+-------------------
+   1 | Delete
+   3 | Update
+   5 | Not quite updated
+   6 | Not inserted
+(4 rows)
+
+-- system columns (don't show tableoid and xmin, but make sure they are numbers)
+SELECT CASE WHEN tableoid >= 0 THEN 0 END AS tableoid,
+	ctid,
+	CASE WHEN xmin::text::int >= 0 THEN 0 END AS xmin,
+	CASE WHEN xmax::text <> '0' THEN xmax::text::int - xmin::text::int END AS xmax,
+	cmin, cmax, recoveryrow, bar, baz
+	FROM pg_recovery('foo', recoveryrow => false)
+	AS t(tableoid oid, ctid tid, xmin xid, xmax xid, cmin cid, cmax cid, recoveryrow boolean, bar bigint, baz text);
+ tableoid | ctid  | xmin | xmax | cmin | cmax | recoveryrow | bar |        baz        
+----------+-------+------+------+------+------+-------------+-----+-------------------
+        0 | (0,1) |    0 |    1 |    0 |    0 | t           |   1 | Delete
+        0 | (0,2) |    0 |      |    0 |    0 | f           |   2 | Insert
+        0 | (0,3) |    0 |    2 |    0 |    0 | t           |   3 | Update
+        0 | (0,4) |    0 |    3 |    0 |    0 | f           |   4 | Not deleted
+        0 | (0,5) |    0 |    3 |    1 |    1 | f           |   5 | Not updated
+        0 | (0,6) |    0 |      |    0 |    0 | f           |   3 | Updated
+        0 | (0,7) |    0 |      |    1 |    1 | t           |   5 | Not quite updated
+        0 | (0,8) |    0 |      |    2 |    2 | t           |   6 | Not inserted
+(8 rows)
+
+-- error cases
+SELECT pg_recovery('foo');
+ERROR:  function returning record called in context that cannot accept type record
+SELECT * FROM pg_recovery(0) as t(bar bigint, baz text);
+ERROR:  invalid relation oid "0"
+SELECT * FROM pg_recovery('foo') as t(bar int, baz text);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "bar" has type bigint in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(moo bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "moo" does not exist in type foo.
+SELECT * FROM pg_recovery('foo') as t(tableoid bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "tableoid" has type oid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(ctid bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "ctid" has type tid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(xmin bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "xmin" has type xid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(xmax bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "xmax" has type xid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(cmin bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "cmin" has type cid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(cmax bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "cmax" has type cid in corresponding attribute of type foo.
+SELECT * FROM pg_recovery('foo') as t(recoveryrow bigint);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "recoveryrow" has type boolean in corresponding attribute of type foo.
+SET ROLE luser;
+SELECT * FROM pg_recovery('foo') as t(bar bigint, baz text);
+ bar |        baz        
+-----+-------------------
+   1 | Delete
+   3 | Update
+   5 | Not quite updated
+   6 | Not inserted
+(4 rows)
+
+RESET ROLE;
+CREATE INDEX ON foo(bar);
+SELECT * FROM pg_recovery('foo_bar_idx') as t(bar bigint);
+ERROR:  "foo_bar_idx" is an index
+-- reading from dropped columns
+CREATE TABLE bar (
+	id int,
+	a int,
+	b bigint,
+	c text,
+	d varchar(10),
+	e boolean,
+	f bigint[],
+	z int
+);
+ALTER TABLE bar SET (
+  autovacuum_enabled = false, toast.autovacuum_enabled = false
+);
+INSERT INTO bar VALUES (1, 2, 3, '4', '5', true, '{7}', 8);
+ALTER TABLE bar DROP COLUMN a, DROP COLUMN b, DROP COLUMN c, DROP COLUMN d, DROP COLUMN e, DROP COLUMN f;
+INSERT INTO bar VALUES (2, 8);
+SELECT * FROM bar;
+ id | z 
+----+---
+  1 | 8
+  2 | 8
+(2 rows)
+
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ id | dropped_attnum_2 | dropped_attnum_3 | dropped_attnum_4 | dropped_attnum_5 | dropped_attnum_6 | dropped_attnum_7 | z 
+----+------------------+------------------+------------------+------------------+------------------+------------------+---
+  1 |                2 |                3 | 4                | 5                | t                | {7}              | 8
+  2 |                  |                  |                  |                  |                  |                  | 8
+(2 rows)
+
+-- errors
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_0 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "dropped_attnum_0" index is out of range 1 .. 8.
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_9 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Attribute "dropped_attnum_9" index is out of range 1 .. 8.
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 bigint, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Type length of dropped column "dropped_attnum_2" was 4.
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 int, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Type length of dropped column "dropped_attnum_3" was 8.
+-- mismatch not catched:
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 timestamptz, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ id | dropped_attnum_2 |          dropped_attnum_3           | dropped_attnum_4 | dropped_attnum_5 | dropped_attnum_6 | dropped_attnum_7 | z 
+----+------------------+-------------------------------------+------------------+------------------+------------------+------------------+---
+  1 |                2 | Fri Dec 31 16:00:00.000003 1999 PST | 4                | 5                | t                | {7}              | 8
+  2 |                  |                                     |                  |                  |                  |                  | 8
+(2 rows)
+
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 int,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Type length of dropped column "dropped_attnum_4" was -1.
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(11), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Type modifier of dropped column "dropped_attnum_5" was character varying(10).
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 text, dropped_attnum_7 bigint[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Type length of dropped column "dropped_attnum_6" was 1.
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 int[], z int);
+ERROR:  Error converting tuple descriptors!
+DETAIL:  Alignment of dropped column "dropped_attnum_7" was d.
+-- mismatch not catched:
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 timestamptz[], z int);
+ id | dropped_attnum_2 | dropped_attnum_3 | dropped_attnum_4 | dropped_attnum_5 | dropped_attnum_6 | dropped_attnum_7 | z 
+----+------------------+------------------+------------------+------------------+------------------+------------------+---
+  1 |                2 |                3 | 4                | 5                | t                | {7}              | 8
+  2 |                  |                  |                  |                  |                  |                  | 8
+(2 rows)
+
+-- clean table
+VACUUM FULL bar;
+SELECT * FROM pg_recovery('bar')
+  bar(id int, dropped_attnum_2 int, dropped_attnum_3 bigint, dropped_attnum_4 text,
+      dropped_attnum_5 varchar(10), dropped_attnum_6 boolean, dropped_attnum_7 bigint[], z int);
+ id | dropped_attnum_2 | dropped_attnum_3 | dropped_attnum_4 | dropped_attnum_5 | dropped_attnum_6 | dropped_attnum_7 | z 
+----+------------------+------------------+------------------+------------------+------------------+------------------+---
+  1 |                  |                  |                  |                  |                  |                  | 8
+  2 |                  |                  |                  |                  |                  |                  | 8
+(2 rows)
+
